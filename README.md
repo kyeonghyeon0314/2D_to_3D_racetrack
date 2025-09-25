@@ -112,7 +112,7 @@ python map_to_3d.py Austin --output my_track.obj
 ## Isaac Sim에서 사용하기
 
 1. 변환된 STL 파일을 Isaac Sim 프로젝트에 임포트
-2. mesh를 rigid body 와 collider 설정 추가
+2. mesh에 collider 설정 추가
 3. Default Material에 rigid body material 설정 추가 Static Friction과 Dynamic Friction 값을 1로 설정
 4. F1TENTH 차량 모델과 함께 시뮬레이션 실행
 
