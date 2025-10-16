@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import yaml
 import trimesh
-from scipy.ndimage import binary_erosion, binary_dilation
+from scipy.ndimage import binary_erosion
 import argparse
 import os
 
@@ -64,94 +64,103 @@ class Map3DConverter:
         return occupancy_grid
 
     def create_wall_mesh(self, occupancy_grid):
-        """Create 3D wall mesh from 2D occupancy grid"""
+        """Create 3D wall mesh from 2D occupancy grid using contours"""
         height, width = occupancy_grid.shape
 
-        # Find wall edges using morphological operations
-        # Erode to find inner boundaries, then subtract to get edges
-        eroded = binary_erosion(occupancy_grid, structure=np.ones((3,3)))
-        wall_edges = occupancy_grid.astype(bool) & ~eroded
+        print("Extracting wall edges using morphological operations...")
+        # 1단계: occupied 영역의 경계 추출
+        eroded_occupied = binary_erosion(occupancy_grid, structure=np.ones((3,3)))
+        occupied_edges = occupancy_grid.astype(bool) & ~eroded_occupied
 
-        vertices = []
-        faces = []
-        vertex_count = 0
+        # 2단계: free space 영역의 경계 추출 (트랙 안쪽 벽을 위해)
+        free_space = ~occupancy_grid.astype(bool)
+        eroded_free = binary_erosion(free_space, structure=np.ones((3,3)))
+        free_edges = free_space & ~eroded_free
 
-        print("Generating 3D mesh from occupancy grid...")
+        # 3단계: 두 경계를 합침 (바깥벽 + 안쪽벽)
+        wall_edges = occupied_edges | free_edges
 
-        # For each wall pixel, create a vertical wall segment
-        wall_pixels = np.where(wall_edges)
-        total_pixels = len(wall_pixels[0])
+        print("Finding wall contours from edges...")
+        # 4단계: wall_edges를 uint8로 변환하여 contour 추출
+        wall_edges_uint8 = (wall_edges * 255).astype(np.uint8)
+        contours, _ = cv2.findContours(wall_edges_uint8, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
-        for i, (row, col) in enumerate(zip(wall_pixels[0], wall_pixels[1])):
-            if i % 1000 == 0:
-                print(f"Processing pixel {i}/{total_pixels}")
-
-            # Convert pixel coordinates to world coordinates
-            # Note: Image row=0 is at top, but world y increases upward
-            world_x = self.origin[0] + col * self.resolution
-            world_y = self.origin[1] + (height - row - 1) * self.resolution
-
-            # Create a small cube for this wall pixel
-            cube_size = self.resolution * 0.9  # Slightly smaller to avoid gaps
-
-            # Define cube vertices (8 vertices per cube)
-            x_min, x_max = world_x, world_x + cube_size
-            y_min, y_max = world_y, world_y + cube_size
-            z_min, z_max = 0.0, self.wall_height
-
-            cube_vertices = [
-                [x_min, y_min, z_min],  # 0: bottom-left-front
-                [x_max, y_min, z_min],  # 1: bottom-right-front
-                [x_max, y_max, z_min],  # 2: bottom-right-back
-                [x_min, y_max, z_min],  # 3: bottom-left-back
-                [x_min, y_min, z_max],  # 4: top-left-front
-                [x_max, y_min, z_max],  # 5: top-right-front
-                [x_max, y_max, z_max],  # 6: top-right-back
-                [x_min, y_max, z_max],  # 7: top-left-back
-            ]
-
-            vertices.extend(cube_vertices)
-
-            # Define cube faces (12 triangles, 2 per face)
-            base_idx = vertex_count
-            cube_faces = [
-                # Bottom face (z=0)
-                [base_idx+0, base_idx+1, base_idx+2],
-                [base_idx+0, base_idx+2, base_idx+3],
-                # Top face (z=wall_height)
-                [base_idx+4, base_idx+6, base_idx+5],
-                [base_idx+4, base_idx+7, base_idx+6],
-                # Front face (y=y_min)
-                [base_idx+0, base_idx+4, base_idx+5],
-                [base_idx+0, base_idx+5, base_idx+1],
-                # Back face (y=y_max)
-                [base_idx+3, base_idx+2, base_idx+6],
-                [base_idx+3, base_idx+6, base_idx+7],
-                # Left face (x=x_min)
-                [base_idx+0, base_idx+3, base_idx+7],
-                [base_idx+0, base_idx+7, base_idx+4],
-                # Right face (x=x_max)
-                [base_idx+1, base_idx+5, base_idx+6],
-                [base_idx+1, base_idx+6, base_idx+2],
-            ]
-
-            faces.extend(cube_faces)
-            vertex_count += 8
-
-        print(f"Generated mesh with {len(vertices)} vertices and {len(faces)} faces")
-
-        # Create trimesh object
-        if len(vertices) == 0:
-            print("Warning: No wall pixels found!")
+        if not contours:
+            print("Warning: No wall contours found!")
             return None
 
-        mesh = trimesh.Trimesh(vertices=np.array(vertices), faces=np.array(faces))
+        mesh_list = []
 
-        # Clean up mesh (remove duplicates, fix normals)
-        mesh.remove_duplicate_faces()
-        mesh.fix_normals()
+        print(f"Found {len(contours)} contours. Extruding to 3D walls...")
+        for i, contour in enumerate(contours):
+            if i % 100 == 0:
+                print(f"Processing contour {i}/{len(contours)}")
 
-        return mesh
+            # 너무 작은 contour는 노이즈일 수 있으니 필터링
+            if cv2.contourArea(contour) < 10:
+                continue
+
+            # 3D 변환을 위해 불필요한 차원 제거 (N, 1, 2) -> (N, 2)
+            contour_points = np.squeeze(contour, axis=1)
+
+            # 최소 3개의 점이 필요함
+            if len(contour_points) < 3:
+                continue
+
+            # 픽셀 좌표를 월드 좌표로 변환
+            # Y축 방향이 이미지 좌표계와 월드 좌표계에서 반대인 것을 보정
+            world_points_x = self.origin[0] + contour_points[:, 0] * self.resolution
+            world_points_y = self.origin[1] + (height - contour_points[:, 1] - 1) * self.resolution
+
+            # 수동으로 벽면 생성 (천장 없이 옆면만)
+            try:
+                num_points = len(world_points_x)
+                vertices = []
+                faces = []
+
+                # 하단 vertices (z=0)와 상단 vertices (z=wall_height) 생성
+                for j in range(num_points):
+                    # 하단 점
+                    vertices.append([world_points_x[j], world_points_y[j], 0.0])
+                    # 상단 점
+                    vertices.append([world_points_x[j], world_points_y[j], self.wall_height])
+
+                # 각 edge를 수직 사각형(2개 삼각형)으로 변환
+                for j in range(num_points):
+                    # 현재 점과 다음 점 인덱스
+                    curr_bottom = j * 2
+                    curr_top = j * 2 + 1
+                    next_bottom = ((j + 1) % num_points) * 2
+                    next_top = ((j + 1) % num_points) * 2 + 1
+
+                    # 사각형을 2개 삼각형으로 분할
+                    # 삼각형 1: bottom_curr, top_curr, bottom_next
+                    faces.append([curr_bottom, curr_top, next_bottom])
+                    # 삼각형 2: top_curr, top_next, bottom_next
+                    faces.append([curr_top, next_top, next_bottom])
+
+                # Trimesh 객체 생성
+                mesh = trimesh.Trimesh(vertices=np.array(vertices), faces=np.array(faces))
+                mesh_list.append(mesh)
+            except Exception as e:
+                # 가끔 매우 작거나 잘못된 형태의 contour는 에러를 발생시킬 수 있습니다.
+                print(f"Warning: Could not create wall mesh for contour {i}. Skipping. Error: {e}")
+
+        if not mesh_list:
+            print("Warning: No valid meshes created!")
+            return None
+
+        # 모든 메쉬를 한 번에 결합 (메모리 효율적)
+        print(f"Combining {len(mesh_list)} meshes...")
+        combined_wall_mesh = trimesh.util.concatenate(mesh_list)
+
+        print(f"Generated mesh with {len(combined_wall_mesh.vertices)} vertices and {len(combined_wall_mesh.faces)} faces")
+
+        # 메쉬 정리 (중복 제거 및 법선 벡터 수정)
+        combined_wall_mesh.remove_duplicate_faces()
+        combined_wall_mesh.fix_normals()
+
+        return combined_wall_mesh
 
     def create_floor_mesh(self, occupancy_grid):
         """Create floor mesh for the entire map area"""
